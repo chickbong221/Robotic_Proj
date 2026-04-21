@@ -66,7 +66,7 @@ class TWISTER(models.Model):
         # Env
         if self.env_type == "dmc":
             self.config.env_class = envs.dm_control.dm_control_dict[env_name[1]]
-            self.config.env_params = {"task": env_name[2], "history_frames": 1, "img_size": (480, 480), "action_repeat": 2}
+            self.config.env_params = {"task": env_name[2], "history_frames": 1, "img_size": (64, 64), "action_repeat": 2}
             self.config.model_size = "S"
             self.config.time_limit = 1000
             self.config.time_limit_eval = 1000
