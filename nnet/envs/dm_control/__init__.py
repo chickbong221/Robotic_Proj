@@ -24,6 +24,7 @@ from .pendulum import Pendulum
 from .quadruped import Quadruped
 from .reacher import Reacher
 from .walker import Walker
+from .manipulator import Manipulator
 
 # DeepMind Control Envs Dictionary
 dm_control_dict = {
@@ -36,5 +37,6 @@ dm_control_dict = {
     "Quadruped": Quadruped,
     "Acrobot": Acrobot,
     "Finger": Finger,
+    "Manipulator": Manipulator,
     "BallInCup": BallInCup,
 }

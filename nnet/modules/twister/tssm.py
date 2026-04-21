@@ -290,7 +290,9 @@ class TSSM(nn.Module):
         # Linear Logits
         logits = self.dynamics_predictor(deter).reshape(deter.shape[:-1] + (self.stoch_size, self.discrete))
         dist_params = {'logits': logits}
-    
+        # print("logits", logits.shape)
+        # print("deter", deter.shape)
+
         # Sample
         stoch = self.get_dist(dist_params).rsample()
 

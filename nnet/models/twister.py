@@ -23,6 +23,7 @@ from nnet import optimizers
 from nnet import envs
 from nnet.modules import twister as twister_networks
 from nnet.structs import AttrDict
+import wandb
 
 # Other
 import copy
@@ -65,7 +66,7 @@ class TWISTER(models.Model):
         # Env
         if self.env_type == "dmc":
             self.config.env_class = envs.dm_control.dm_control_dict[env_name[1]]
-            self.config.env_params = {"task": env_name[2], "history_frames": 1, "img_size": (64, 64), "action_repeat": 2}
+            self.config.env_params = {"task": env_name[2], "history_frames": 1, "img_size": (480, 480), "action_repeat": 2}
             self.config.model_size = "S"
             self.config.time_limit = 1000
             self.config.time_limit_eval = 1000
@@ -179,7 +180,7 @@ class TWISTER(models.Model):
         self.config.random_pre_fill_steps = True
 
         # Log Figure
-        self.config.log_figure_batch = 16
+        self.config.log_figure_batch = 2
         self.config.log_figure_context_frames = 5
 
         # Override Config
@@ -1273,8 +1274,7 @@ class TWISTER(models.Model):
         # batch_losses, batch_metrics, batch_truths, batch_preds
         return {}, outputs, {}, {}
     
-    def log_figure(self, step, inputs, targets, writer, tag, save_image=False): 
-
+    def log_figure(self, epoch, inputs, targets, writer, tag, save_image=False):
         # Eval Mode
         mode = self.training
         self.eval()
@@ -1284,14 +1284,13 @@ class TWISTER(models.Model):
 
         # Unpack Inputs 
         states, actions, rewards, dones, is_firsts, model_steps = inputs
-        
+
         # Number of Rows
         states = states[:self.config.log_figure_batch]
         actions = actions[:self.config.log_figure_batch]
         is_firsts = is_firsts[:self.config.log_figure_batch]
 
         with torch.no_grad():
-
             # Forward Representation Network (B, L, D)
             latent = self.encoder_network(states)
 
@@ -1301,9 +1300,9 @@ class TWISTER(models.Model):
 
             # Model Observe (B, L, D)
             posts, priors = self.rssm.observe(
-                states=latent, 
-                prev_actions=actions, 
-                is_firsts=is_firsts, 
+                states=latent,
+                prev_actions=actions,
+                is_firsts=is_firsts,
                 prev_state=None,
                 is_firsts_hidden=None,
             )
@@ -1315,54 +1314,7 @@ class TWISTER(models.Model):
             states_rec = self.decoder_network(posts["stoch"].flatten(-2, -1)).mode()
 
             ###############################################################################
-            # Model Contrastive Loss
-            ###############################################################################
-
-            # Flatten B and L to ensure diff augment for each sample (B*L, 3, H, W)
-            states_flatten = states.flatten(0, 1)
-
-            # Augment
-            states_aug_con = torch.stack([self.config.contrastive_augments(states_flatten[b]) for b in range(states_flatten.shape[0])], dim=0).reshape(states.shape)
-
-            # Forward
-            posts_con = self.encoder_network(states_aug_con)
-
-            contrastive_sorted_indices = []
-
-            for t in range(self.config.contrastive_steps):
-
-                # Action condition (B, L-t, A*t)
-                if t > 0:
-                    actions_cond = torch.cat([actions[:, 1+t_:min(actions.shape[1], actions.shape[1]+1+t_-t)] for t_ in range(t)], dim=-1)
-
-                # Contrastive features (B, L-t, D)
-                features_feats, features_embed = self.contrastive_network[t](
-                    feats=self.rssm.get_feat(priors) if t==0 else torch.cat([self.rssm.get_feat(priors)[:, :-t], actions_cond], dim=-1),
-                    embed=posts_con["stoch"].flatten(-2, -1) if t==0 else posts_con["stoch"].flatten(-2, -1)[:, t:]
-                )
-
-                def get_sorted_indices(features_x, features_y):
-
-                    # Flatten (B', D)
-                    features_x = features_x.flatten(start_dim=0, end_dim=1)
-                    features_y = features_y.flatten(start_dim=0, end_dim=1)
-
-                    # Matmul (B', B')
-                    features = features_x.matmul(features_y.transpose(0, 1))
-
-                    # Sort indices (B', B')
-                    sorted_indices = torch.argsort(features, dim=-1, descending=True)
-
-                    return sorted_indices
-                    
-                if features_feats.dtype != torch.float32:
-                    with torch.cuda.amp.autocast(enabled=False):
-                        contrastive_sorted_indices.append(get_sorted_indices(features_feats.type(torch.float32), features_embed.type(torch.float32)))
-                else:
-                    contrastive_sorted_indices.append(get_sorted_indices(features_feats, features_embed))
-
-            ###############################################################################
-            # Imaginary
+            # Imaginary (modified for 2-timestep motion computation)
             ###############################################################################
 
             # Initial State
@@ -1381,65 +1333,75 @@ class TWISTER(models.Model):
 
             # Model Imagine (B, 1+L-C, D)
             img_states = self.rssm.imagine(
-                p_net=self.policy_network, 
-                prev_state=prev_state, 
-                img_steps=self.config.L-self.config.log_figure_context_frames,
+                p_net=self.policy_network,
+                prev_state=prev_state,
+                img_steps=self.config.L - self.config.log_figure_context_frames,
                 is_firsts=None,
                 is_firsts_hidden=None
             )
 
             # Img States (B, L, ...)
-            states_img = self.decoder_network(torch.cat([posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1) , img_states["stoch"][:, 1:].flatten(-2, -1)], dim=1)).mode()
+            # Note: img_states["stoch"] now starts with the most recent context state
+            if self.config.log_figure_context_frames == 0:
+                # No context: use all imagined states (skip the initial duplicated state)
+                states_img = self.decoder_network(
+                    img_states["stoch"][:, 1:].flatten(-2, -1)
+                ).mode()
+            else:
+                # With context: combine context frames with imagined states
+                states_img = self.decoder_network(
+                    torch.cat([
+                        posts["stoch"][:, :self.config.log_figure_context_frames].flatten(-2, -1),
+                        img_states["stoch"][:, 1:].flatten(-2, -1)
+                    ], dim=1)
+                ).mode()
 
-        # Shift to 0 1
+        # Shift to 0..1 for display
         states_shift = states.clip(-0.5, 0.5) + 0.5
         states_rec_shift = states_rec.clip(-0.5, 0.5) + 0.5
-        error_shift = 1 - torch.abs(states_rec_shift - states_shift).mean(dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
+        error_rec_shift = 1 - torch.abs(states_rec_shift - states_shift).mean(dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
         states_img_shift = states_img.clip(-0.5, 0.5) + 0.5
+        error_img_shift = 1 - torch.abs(states_img_shift - states_shift).mean(dim=2, keepdim=True).repeat(1, 1, 3, 1, 1)
+
+        # Add Figure to logs - split into 5-frame chunks, skip last 4 frames
+        # Calculate number of frames to use (skip last 4)
+        num_frames = self.config.L
+        chunk_size = num_frames
+        num_chunks = num_frames // chunk_size
         
-        # Expand is Firsts
-        is_firsts = is_firsts.unsqueeze(dim=-1).unsqueeze(dim=-1).unsqueeze(dim=-1).expand_as(states) * states_shift
+        for chunk_idx in range(num_chunks):
+            # Extract 5 frames from each visualization type
+            start_frame = chunk_idx * chunk_size
+            end_frame = start_frame + chunk_size
 
-        # Concat Outputs
-        outputs = torch.concat([
-            is_firsts, 
-            states_shift, 
-            states_rec_shift, 
-            error_shift, 
-            states_img_shift,
-        ], dim=1).flatten(start_dim=0, end_dim=1)
+            states_chunk = states_shift[:, start_frame:end_frame]
+            states_rec_chunk = states_rec_shift[:, start_frame:end_frame]
+            error_rec_chunk = error_rec_shift[:, start_frame:end_frame]
+            states_img_chunk = states_img_shift[:, start_frame:end_frame]
+            error_img_chunk = error_img_shift[:, start_frame:end_frame]
 
-        # Add Figure to logs
-        if writer != None:
+            # Concat the 5 visualization types for this chunk
+            chunk_outputs = torch.concat(
+                [
+                    states_chunk,
+                    states_rec_chunk,
+                    error_rec_chunk,
+                    states_img_chunk,
+                    error_img_chunk,
+                ],
+                dim=1
+            ).flatten(start_dim=0, end_dim=1)  # (B*5*5, C, H, W)
 
-            # Log Image
-            fig = torchvision.utils.make_grid(outputs, nrow=self.config.L, normalize=False, scale_each=False).cpu()
-            writer.add_image(tag, fig, step)
+            # Create grid: 5 columns (time frames)
+            fig = torchvision.utils.make_grid(
+                chunk_outputs,
+                nrow=chunk_size,
+                normalize=False,
+                scale_each=False,
+            )
 
-            # Log Contrastive: 
-            # for each contrastive t, log a figure of contrastive_batch random samples from the batch and their contrastive_most_less most sim state
-            # repeat with less similar
-            # end up with 2*contrastive_steps figures of contrastive_batch*contrastive_most_less images
-            states_aug_con = states_aug_con.flatten(start_dim=0, end_dim=1)
+            # Log to wandb
+            wandb.log({f"{tag}/chunk_{chunk_idx}": wandb.Image(fig)})
 
-            for t in range(self.config.contrastive_steps):
-
-                contrastive_batch = 10
-                contrastive_most_less = 10
-
-                # select 10 samples from batch
-                samples_i = torch.randint(0, contrastive_sorted_indices[t].shape[0], size=(contrastive_batch,))
-                    
-                outputs_con = torch.cat([
-                    torch.cat([
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], (contrastive_sorted_indices[t][sample_i, :contrastive_most_less] == sample_i).unsqueeze(dim=-1).unsqueeze(dim=-1).unsqueeze(dim=-1).expand_as(states.flatten(0, 1)[sample_i:sample_i+1].repeat(contrastive_most_less, 1, 1, 1)) * states.flatten(0, 1)[sample_i:sample_i+1].repeat(contrastive_most_less, 1, 1, 1)], dim=0),
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], states_aug_con[contrastive_sorted_indices[t][sample_i, :contrastive_most_less]]], dim=0),
-                        torch.cat([states.flatten(0, 1)[sample_i:sample_i+1], states_aug_con[contrastive_sorted_indices[t][sample_i, -contrastive_most_less:]]], dim=0)
-                    ], dim=0)
-                for sample_i in samples_i], dim=0)
-
-                fig = torchvision.utils.make_grid(outputs_con, nrow=1+contrastive_most_less, normalize=True, scale_each=True).cpu()
-                writer.add_image(tag + "-contrastive-{}".format(t), fig, step)
-
-        # Default Mode
+        # Default Mode: restore training/eval mode
         self.train(mode=mode)

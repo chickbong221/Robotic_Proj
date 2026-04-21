@@ -16,6 +16,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from fvcore.nn import FlopCountAnalysis
 
 # Other
 from tqdm import tqdm
@@ -29,6 +30,21 @@ from nnet import modules
 from nnet import schedulers
 from nnet.optimizers import optim_dict
 
+class _TFLOPsForwardWrapper(nn.Module):
+    def __init__(self, model, compute_metrics):
+        super().__init__()
+        self.model = model
+        self.compute_metrics = compute_metrics
+
+    def forward(self, inputs, targets):
+        batch_losses, _, _, _ = self.model.forward_model(
+            inputs,
+            targets,
+            compute_metrics=self.compute_metrics,
+        )
+        # Return a tensor so fvcore has a clean output
+        return batch_losses["loss"]
+        
 class Model(modules.Module):
 
     def __init__(self, name="model"):
@@ -295,6 +311,30 @@ class Model(modules.Module):
 
         return batch_losses, batch_metrics, batch_truths, batch_preds
 
+    def _print_tflops_once(self, inputs, targets, eval_training):
+        if hasattr(self, "_tflops_printed"):
+            return
+
+        was_training = self.training
+        self.eval()
+
+        wrapper = _TFLOPsForwardWrapper(self, compute_metrics=eval_training)
+        wrapper.eval()
+
+        with torch.no_grad():
+            flops = FlopCountAnalysis(
+                wrapper,
+                (inputs, targets),
+            ).total()
+
+        tflops = flops / 1e9
+        print(f"[GFLOPs] Forward pass: {tflops:.3f} GFLOPs")
+
+        self._tflops_printed = True
+
+        if was_training:
+            self.train()
+
     def train_step(self, inputs, targets, precision, grad_scaler, accumulated_steps, acc_step, eval_training):
 
         """ train_step method
@@ -303,6 +343,9 @@ class Model(modules.Module):
         - backward
         
         """
+
+        # === Measure & print TFLOPs once ===
+        # self._print_tflops_once(inputs, targets, eval_training)
 
         # Automatic Mixed Precision Casting (model forward + loss computing)
         if "cuda" in str(self.device):
