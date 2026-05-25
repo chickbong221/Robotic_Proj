@@ -7,3 +7,4 @@ callbacks/*
 .cache
 wandb/*
 env_twister/*
+ManiSkill/
